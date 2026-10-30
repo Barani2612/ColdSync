@@ -1,0 +1,538 @@
+"""
+app.py
+------------------------------------------------------------------------
+Flask backend for the Vaccine Cold Chain Management System.
+
+Responsibilities
+------------------------------------------------------------------------
+1. Receive sensor data from the ESP32 over HTTP POST (/api/data), both
+   "live" readings and "backlog" (offline-buffered, SD-synced) readings.
+2. Run every incoming reading through the trained ML model to predict
+   safe holdover time remaining.
+3. Persist everything to SQLite (database.py).
+4. Serve two role-based dashboards (admin / user) plus a small JSON API
+   the dashboards poll for live charts.
+5. Basic session-based authentication.
+
+Run:
+    python app.py
+Then browse to http://<this-machine-ip>:5000/login
+------------------------------------------------------------------------
+"""
+
+import os
+import sys
+import csv
+import io
+import json
+import time
+import threading
+import urllib.request
+import urllib.error
+import hashlib
+from pathlib import Path
+from datetime import datetime, timezone
+from functools import wraps
+from flask import (
+    Flask, request, jsonify, render_template, redirect, url_for,
+    session, flash, Response
+)
+from werkzeug.security import check_password_hash
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+
+sys.path.append(os.path.join(os.path.dirname(__file__), "ml_model"))
+
+import database as db
+import predict as ml
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("COLDCHAIN_SECRET_KEY", "dev-secret-change-me")
+
+API_KEY = "esp32-coldchain-key-01"   # must match the ESP32 firmware's API_KEY
+DEFAULT_DEVICE = "COLD_BOX_01"
+
+# ESP2 local dashboard API. Override with environment variable if needed.
+ESP2_API_URL = os.environ.get("COLDTRACE_ESP2_API_URL", "http://192.168.1.100/api/data")  # replace with ESP2 IP from Serial Monitor
+ESP2_POLL_SECONDS = float(os.environ.get("COLDTRACE_POLL_SECONDS", "3"))
+_bridge_status = {"connected": False, "last_success": None, "last_error": "Waiting for first ESP2 response", "last_packet": None}
+_bridge_lock = threading.Lock()
+
+def _first(payload, *keys, default=None):
+    for key in keys:
+        if key in payload and payload[key] is not None:
+            return payload[key]
+    return default
+
+def _parse_esp2_timestamp(payload):
+    value = _first(payload, "timestamp", "datetime", "rtcTimestamp", "time")
+    if value is None or str(value).strip() == "":
+        return datetime.now().astimezone().isoformat(timespec="seconds")
+    return str(value)
+
+def _poll_esp2_forever():
+    """Bridge ESP2 GET /api/data into the existing SQLite/dashboard API."""
+    while True:
+        try:
+            req = urllib.request.Request(ESP2_API_URL, headers={"Accept": "application/json", "Cache-Control": "no-cache"})
+            with urllib.request.urlopen(req, timeout=3) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("ESP2 /api/data did not return a JSON object")
+
+            # Accept both the current ESP2 names and common earlier firmware names.
+            core = _first(payload, "core1", "coreTemp1C", "core_temp", "coreTemp", "coreTemp1")
+            ambient = _first(payload, "ambient", "ambientTempC", "ambient_temp", "ambientTemp")
+            humidity = _first(payload, "hum", "humidityPct", "ambient_hum", "humidity", "ambientHum")
+            if core is None or ambient is None or humidity is None:
+                raise ValueError("Missing temperature/humidity fields in ESP2 JSON. Keys received: " + ", ".join(payload.keys()))
+
+            core = float(core); ambient = float(ambient); humidity = float(humidity)
+            timestamp = _parse_esp2_timestamp(payload)
+            packet = _first(payload, "packetNumber", "packet_number", "sequence", "uptime", default=None)
+            # Only store once per changed packet, preventing duplicate history rows.
+            with _bridge_lock:
+                previous_packet = _bridge_status.get("last_packet")
+            packet_key = str(packet) if packet is not None else None
+            if packet_key is None or packet_key != previous_packet:
+                excursion = bool(_first(payload, "excursion", "temperatureAlarm", "alarm", "lid", "lidOpen", default=False))
+                # Enforce vaccine core temperature safety bounds as an additional check.
+                excursion = excursion or core < 2.0 or core > 8.0
+                try:
+                    holdover = ml.predict_holdover(core, ambient, humidity)
+                except Exception as model_error:
+                    # A broken optional ML environment must not block live sensor ingestion.
+                    holdover = None
+                    print(f"[ML] Prediction unavailable; storing live reading without prediction: {model_error}")
+                db.insert_reading(DEFAULT_DEVICE, timestamp, core, ambient, humidity, excursion, "live", holdover)
+            with _bridge_lock:
+                _bridge_status.update({"connected": True, "last_success": datetime.now().astimezone().isoformat(timespec="seconds"), "last_error": None, "last_packet": packet_key, "latest_data": payload})
+        except Exception as exc:
+            with _bridge_lock:
+                _bridge_status.update({"connected": False, "last_error": str(exc)})
+        time.sleep(max(1.0, ESP2_POLL_SECONDS))
+
+
+# ---------------------------------------------------------------------------
+# FIREBASE REALTIME DATABASE SYNC (offline SD CSV -> cloud)
+# ---------------------------------------------------------------------------
+FIREBASE_API_KEY = os.environ.get("FIREBASE_API_KEY", "").strip()
+FIREBASE_DATABASE_URL = os.environ.get("FIREBASE_DATABASE_URL", "").strip().rstrip("/")
+FIREBASE_EMAIL = os.environ.get("FIREBASE_EMAIL", "").strip()
+FIREBASE_PASSWORD = os.environ.get("FIREBASE_PASSWORD", "")
+FIREBASE_SYNC_SECONDS = max(10, int(os.environ.get("COLDTRACE_FIREBASE_SYNC_SECONDS", "20")))
+CLOUD_STATE_PATH = os.path.join(os.path.dirname(__file__), "data", "firebase_synced_ids.json")
+_cloud_lock = threading.Lock()
+_cloud_status = {"configured": bool(FIREBASE_API_KEY and FIREBASE_DATABASE_URL and FIREBASE_EMAIL and FIREBASE_PASSWORD), "connected": False, "last_sync": None, "last_error": "Firebase credentials not configured", "uploaded_total": 0, "pending_seen": 0}
+_firebase_token = {"id_token": None, "expires_at": 0}
+
+
+def _cloud_configured():
+    return bool(FIREBASE_API_KEY and FIREBASE_DATABASE_URL and FIREBASE_EMAIL and FIREBASE_PASSWORD)
+
+
+
+
+def _firebase_auth():
+    now = time.time()
+    if _firebase_token["id_token"] and now < _firebase_token["expires_at"] - 60:
+        return _firebase_token["id_token"]
+
+    url = (
+        "https://identitytoolkit.googleapis.com/v1/"
+        "accounts:signInWithPassword?key=" + FIREBASE_API_KEY
+    )
+    body = json.dumps({
+        "email": FIREBASE_EMAIL,
+        "password": FIREBASE_PASSWORD,
+        "returnSecureToken": True
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        details = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Firebase sign-in failed (HTTP {exc.code}): {details}"
+        ) from exc
+
+    _firebase_token["id_token"] = payload["idToken"]
+    _firebase_token["expires_at"] = now + int(payload.get("expiresIn", "3600"))
+    return _firebase_token["id_token"]
+
+
+
+def _load_synced_ids():
+    try:
+        with open(CLOUD_STATE_PATH, "r", encoding="utf-8") as f:
+            value = json.load(f)
+        return set(value if isinstance(value, list) else [])
+    except (OSError, ValueError):
+        return set()
+
+
+def _save_synced_ids(ids):
+    os.makedirs(os.path.dirname(CLOUD_STATE_PATH), exist_ok=True)
+    temp_path = CLOUD_STATE_PATH + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(sorted(ids), f)
+    os.replace(temp_path, CLOUD_STATE_PATH)
+
+
+def _firebase_probe(token):
+    # A lightweight authenticated request distinguishes an actually reachable cloud from a cached token.
+    url = f"{FIREBASE_DATABASE_URL}/telemetry.json?shallow=true&auth={token}"
+    req = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"Firebase connectivity check returned HTTP {resp.status}")
+        resp.read()
+
+
+def _firebase_put(event_id, record, token):
+    url = f"{FIREBASE_DATABASE_URL}/telemetry/{event_id}.json?auth={token}"
+    body = json.dumps(record, separators=(",", ":")).encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="PUT")
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        if resp.status not in (200, 201):
+            raise RuntimeError(f"Firebase write returned HTTP {resp.status}")
+        resp.read()
+
+
+def _csv_row_to_record(row):
+    # Preserve original CSV fields while also exposing numeric types for querying.
+    def num(key, cast=float, default=None):
+        raw = row.get(key, "")
+        if raw is None or str(raw).strip() == "":
+            return default
+        try:
+            return cast(raw)
+        except (ValueError, TypeError):
+            return default
+    timestamp = str(row.get("Timestamp", "")).strip()
+    packet_number = str(row.get("PacketNumber", "")).strip()
+    if not timestamp or not packet_number:
+        return None, None
+    raw_id = f"COLD_BOX_01|{timestamp}|{packet_number}"
+    event_id = hashlib.sha256(raw_id.encode("utf-8")).hexdigest()[:32]
+    record = {
+        "device_id": "COLD_BOX_01", "event_id": event_id, "timestamp": timestamp,
+        "packet_number": num("PacketNumber", int), "esp1_uptime_ms": num("ESP1UptimeMs", int),
+        "ambient_temp_c": num("AmbientTempC"), "dht11_ambient_humidity_pct": num("DHT11AmbientHumidityPct"),
+        "sht31_internal_humidity_pct": num("SHT31InternalHumidityPct"), "sht31_valid": num("SHT31Valid", int, 0) == 1,
+        "core_temp_1_c": num("CoreTemp1C"), "core_temp_2_c": num("CoreTemp2C"),
+        "ina219_bus_voltage_v": num("INA219BusVoltageV"), "ina219_shunt_voltage_mv": num("INA219ShuntVoltageMv"),
+        "ina219_current_ma": num("INA219CurrentMa"), "ina219_power_mw": num("INA219PowerMw"),
+        "acs712_current_a": num("ACS712CurrentA"), "ldr_raw": num("LDRRaw", int),
+        "lid_open": num("LidOpen", int, 0) == 1, "vibration": num("Vibration", int, 0) == 1,
+        "temperature_alarm": num("TemperatureAlarm", int, 0) == 1,
+        "dht_valid": num("DHTValid", int, 0) == 1, "ds1_valid": num("DS1Valid", int, 0) == 1,
+        "ds2_valid": num("DS2Valid", int, 0) == 1, "ina_valid": num("INAValid", int, 0) == 1,
+        "gps_valid": num("GPSValid", int, 0) == 1, "latitude": num("Latitude"), "longitude": num("Longitude"),
+        "speed_kmph": num("SpeedKmph"), "satellites": num("Satellites", int),
+        "moving": num("Moving", int, 0) == 1, "excursion": num("Excursion", int, 0) == 1,
+        "source": "microSD_csv", "synced_at": datetime.now(timezone.utc).isoformat(timespec="seconds")
+    }
+    return event_id, record
+
+
+def _sync_sd_csv_to_firebase_forever():
+    """Download the SD CSV through ESP2's local API and idempotently sync pending rows to Firebase."""
+    synced_ids = _load_synced_ids()
+    csv_url = ESP2_API_URL.rsplit("/", 1)[0] + "/telemetry.csv"
+    while True:
+        if not _cloud_configured():
+            with _cloud_lock:
+                _cloud_status.update({"configured": False, "connected": False, "last_error": "Firebase credentials not configured in backend/.env"})
+            time.sleep(FIREBASE_SYNC_SECONDS)
+            continue
+        try:
+            req = urllib.request.Request(csv_url, headers={"Accept": "text/csv", "Cache-Control": "no-cache"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                csv_text = resp.read().decode("utf-8-sig", errors="replace")
+            rows = list(csv.DictReader(io.StringIO(csv_text)))
+            pending = []
+            for row in rows:
+                event_id, record = _csv_row_to_record(row)
+                if event_id and event_id not in synced_ids:
+                    pending.append((event_id, record))
+            with _cloud_lock:
+                _cloud_status["pending_seen"] = len(pending)
+            token = _firebase_auth()
+            _firebase_probe(token)
+            if pending:
+                uploaded_now = 0
+                for event_id, record in pending:
+                    # A stable Firebase key makes a retry idempotent if the process stops mid-sync.
+                    _firebase_put(event_id, record, token)
+                    synced_ids.add(event_id)
+                    uploaded_now += 1
+                    if uploaded_now % 10 == 0:
+                        _save_synced_ids(synced_ids)
+                _save_synced_ids(synced_ids)
+                with _cloud_lock:
+                    _cloud_status["uploaded_total"] = len(synced_ids)
+            with _cloud_lock:
+                _cloud_status.update({"configured": True, "connected": True, "last_sync": datetime.now().astimezone().isoformat(timespec="seconds"), "last_error": None, "pending_seen": 0})
+        except Exception as exc:
+            with _cloud_lock:
+                _cloud_status.update({"configured": True, "connected": False, "last_error": str(exc)})
+        time.sleep(FIREBASE_SYNC_SECONDS)
+
+
+# ---------------------------------------------------------------------------
+# AUTH HELPERS
+# ---------------------------------------------------------------------------
+def login_required(role=None):
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            if "username" not in session:
+                return redirect(url_for("login", next=request.path))
+            if role and session.get("role") != role:
+                flash("You don't have access to that page.", "error")
+                return redirect(url_for("user_dashboard"))
+            return fn(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+# ---------------------------------------------------------------------------
+# DEVICE API — called by the ESP32 firmware
+# ---------------------------------------------------------------------------
+@app.route("/api/data", methods=["POST"])
+def api_data():
+    if request.headers.get("X-API-Key") != API_KEY:
+        return jsonify({"error": "unauthorized"}), 401
+
+    payload = request.get_json(silent=True)
+    if not payload:
+        return jsonify({"error": "invalid or missing JSON body"}), 400
+
+    required = ["device_id", "timestamp", "core_temp", "ambient_temp", "ambient_hum"]
+    missing = [k for k in required if k not in payload]
+    if missing:
+        return jsonify({"error": f"missing fields: {missing}"}), 400
+
+    device_id = payload["device_id"]
+    timestamp = payload["timestamp"]
+    core_temp = float(payload["core_temp"])
+    ambient_temp = float(payload["ambient_temp"])
+    ambient_hum = float(payload["ambient_hum"])
+    excursion = bool(payload.get("excursion", False))
+    source = payload.get("source", "live")
+
+    holdover_hours = ml.predict_holdover(core_temp, ambient_temp, ambient_hum)
+
+    reading_id = db.insert_reading(
+        device_id=device_id,
+        timestamp=timestamp,
+        core_temp=core_temp,
+        ambient_temp=ambient_temp,
+        ambient_hum=ambient_hum,
+        excursion=excursion,
+        source=source,
+        predicted_holdover_hours=holdover_hours,
+    )
+
+    return jsonify({
+        "status": "ok",
+        "reading_id": reading_id,
+        "predicted_holdover_hours": holdover_hours,
+    }), 201
+
+
+@app.route("/api/rtc/sync", methods=["POST"])
+def api_rtc_sync():
+    """Set ESP2's physical DS3231 from laptop/backend local time and require read-back confirmation."""
+    payload = request.get_json(silent=True) or {}
+    try:
+        if all(k in payload for k in ("year", "month", "day", "hour", "minute", "second")):
+            values = {k: int(payload[k]) for k in ("year", "month", "day", "hour", "minute", "second")}
+            datetime(values["year"], values["month"], values["day"], values["hour"], values["minute"], values["second"])
+        else:
+            now = datetime.now().astimezone()
+            values = {"year": now.year, "month": now.month, "day": now.day, "hour": now.hour, "minute": now.minute, "second": now.second}
+        rtc_url = ESP2_API_URL.rsplit("/", 1)[0] + "/rtc/set"
+        body = json.dumps(values).encode("utf-8")
+        req = urllib.request.Request(rtc_url, data=body, headers={"Content-Type": "application/json", "Accept": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            if resp.status != 200 or not result.get("ok") or not result.get("verified"):
+                return jsonify({"ok": False, "error": result.get("error", "ESP2 did not verify RTC write"), "device": result}), 502
+        return jsonify({"ok": True, "verified": True, "rtc_timestamp": result.get("rtc_timestamp"), "message": "DS3231 updated and read-back verified"})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc), "esp2_rtc_url": ESP2_API_URL.rsplit("/", 1)[0] + "/rtc/set"}), 502
+
+
+@app.route("/api/cloud-status", methods=["GET"])
+def api_cloud_status():
+    with _cloud_lock:
+        status = dict(_cloud_status)
+    status["esp2_csv_url"] = ESP2_API_URL.rsplit("/", 1)[0] + "/telemetry.csv"
+    return jsonify(status)
+
+
+@app.route("/api/bridge-status", methods=["GET"])
+def api_bridge_status():
+    with _bridge_lock:
+        status = dict(_bridge_status)
+    status["esp2_api_url"] = ESP2_API_URL
+    return jsonify(status)
+
+
+@app.route("/api/predict", methods=["GET"])
+def api_predict():
+    """On-demand 'what-if' prediction, used by the dashboard's simulator widget."""
+    try:
+        core_temp = float(request.args.get("core_temp", 5))
+        ambient_temp = float(request.args.get("ambient_temp", 22))
+        ambient_hum = float(request.args.get("ambient_hum", 45))
+    except ValueError:
+        return jsonify({"error": "core_temp, ambient_temp, ambient_hum must be numbers"}), 400
+
+    hours = ml.predict_holdover(core_temp, ambient_temp, ambient_hum)
+    return jsonify({"predicted_holdover_hours": hours})
+
+
+@app.route("/api/latest")
+def api_latest():
+    device_id = request.args.get("device_id", DEFAULT_DEVICE)
+    return jsonify(db.get_latest_reading(device_id) or {})
+
+
+@app.route("/api/history")
+def api_history():
+    device_id = request.args.get("device_id", DEFAULT_DEVICE)
+    limit = int(request.args.get("limit", 200))
+    return jsonify(db.get_history(device_id, limit))
+
+
+@app.route("/api/alerts")
+def api_alerts():
+    device_id = request.args.get("device_id", DEFAULT_DEVICE)
+    return jsonify(db.get_alerts(device_id))
+
+
+@app.route("/api/stats")
+def api_stats():
+    device_id = request.args.get("device_id", DEFAULT_DEVICE)
+    return jsonify(db.get_stats(device_id))
+
+
+# ---------------------------------------------------------------------------
+# ADMIN-ONLY API
+# ---------------------------------------------------------------------------
+@app.route("/api/export")
+@login_required(role="admin")
+def api_export():
+    """CSV export of full reading history, for the admin dashboard's Export button."""
+    device_id = request.args.get("device_id", DEFAULT_DEVICE)
+    rows = db.get_history(device_id, limit=100000)
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["timestamp", "core_temp", "ambient_temp", "ambient_hum",
+                      "excursion", "predicted_holdover_hours", "source", "received_at"])
+    for r in rows:
+        writer.writerow([r["timestamp"], r["core_temp"], r["ambient_temp"], r["ambient_hum"],
+                          r["excursion"], r["predicted_holdover_hours"], r["source"], r["received_at"]])
+
+    return Response(
+        buf.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={device_id}_history.csv"},
+    )
+
+
+@app.route("/api/users", methods=["GET", "POST"])
+@login_required(role="admin")
+def api_users():
+    if request.method == "POST":
+        payload = request.get_json(silent=True) or {}
+        username = payload.get("username", "").strip()
+        password = payload.get("password", "")
+        role = payload.get("role", "user")
+        if not username or not password or role not in ("admin", "user"):
+            return jsonify({"error": "username, password and a valid role are required"}), 400
+        if db.get_user(username):
+            return jsonify({"error": "username already exists"}), 409
+        db.create_user(username, password, role)
+        return jsonify({"status": "created"}), 201
+    return jsonify(db.list_users())
+
+
+@app.route("/api/devices")
+@login_required(role="admin")
+def api_devices():
+    return jsonify(db.get_devices())
+
+
+@app.route("/api/alerts/<int:alert_id>/ack", methods=["POST"])
+@login_required(role="admin")
+def api_ack_alert(alert_id):
+    db.acknowledge_alert(alert_id)
+    return jsonify({"status": "acknowledged"})
+
+
+# ---------------------------------------------------------------------------
+# AUTH ROUTES
+# ---------------------------------------------------------------------------
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        user = db.get_user(username)
+        if user and check_password_hash(user["password_hash"], password):
+            session["username"] = user["username"]
+            session["role"] = user["role"]
+            return redirect(url_for("admin_dashboard") if user["role"] == "admin" else url_for("user_dashboard"))
+        flash("Invalid username or password.", "error")
+    return render_template("login.html")
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+@app.route("/")
+def index():
+    return redirect(url_for("login"))
+
+
+# ---------------------------------------------------------------------------
+# DASHBOARD PAGES
+# ---------------------------------------------------------------------------
+@app.route("/admin")
+@login_required(role="admin")
+def admin_dashboard():
+    return render_template("live_dashboard.html", username=session["username"], device_id=DEFAULT_DEVICE, role="admin")
+
+
+@app.route("/user")
+@login_required()
+def user_dashboard():
+    return render_template("live_dashboard.html", username=session["username"], device_id=DEFAULT_DEVICE, role=session.get("role", "user"))
+
+
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    db.init_db()
+    # use_reloader=False prevents Flask's debug reloader from starting two pollers.
+    threading.Thread(target=_poll_esp2_forever, name="esp2-bridge", daemon=True).start()
+    threading.Thread(target=_sync_sd_csv_to_firebase_forever, name="firebase-sd-sync", daemon=True).start()
+    print(f"[ColdTrace bridge] Polling ESP2 at {ESP2_API_URL} every {ESP2_POLL_SECONDS:g}s")
+    print(f"[ColdTrace Firebase] SD CSV sync interval: {FIREBASE_SYNC_SECONDS}s; configured={_cloud_configured()}")
+    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)

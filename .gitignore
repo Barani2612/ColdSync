@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+backend/data/*.db
+.DS_Store
+~$*
+.~lock*
+backend/.env
+backend/data/firebase_synced_ids.json
